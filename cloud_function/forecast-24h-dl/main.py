@@ -90,6 +90,47 @@ def calendar_features(hours_utc):
     return out
 
 
+# Optional extra "future" columns (HS, Nov 2026). Used ONLY when model_card.json lists them in "extra_features",
+# so a model trained without them gets exactly the original 13 future columns.
+BDL_LAT, BDL_LON = 41.9389, -72.6832     # Bradley International Airport
+EXTRA_FEATURES = ["hdh", "cdh", "sun_strength", "is_dark", "expected_solar"]
+
+
+def sun_elevation_deg(hours_utc):
+    """The sun's height above the horizon at Bradley, in degrees, at the middle of each UTC hour (NOAA formula)."""
+    t = pd.DatetimeIndex(hours_utc) + pd.Timedelta(minutes=30)
+    day = t.dayofyear.values.astype(float)
+    hour = t.hour.values + t.minute.values / 60.0
+    g = 2 * np.pi / 365.0 * (day - 1 + (hour - 12) / 24.0)
+    decl = (0.006918 - 0.399912 * np.cos(g) + 0.070257 * np.sin(g) - 0.006758 * np.cos(2 * g)
+            + 0.000907 * np.sin(2 * g) - 0.002697 * np.cos(3 * g) + 0.00148 * np.sin(3 * g))
+    eqtime = 229.18 * (0.000075 + 0.001868 * np.cos(g) - 0.032077 * np.sin(g) - 0.014615 * np.cos(2 * g)
+                       - 0.040849 * np.sin(2 * g))
+    true_solar_minutes = hour * 60 + eqtime + 4 * BDL_LON
+    hour_angle = np.radians(true_solar_minutes / 4 - 180)
+    lat = np.radians(BDL_LAT)
+    cos_zenith = np.sin(lat) * np.sin(decl) + np.cos(lat) * np.cos(decl) * np.cos(hour_angle)
+    return 90 - np.degrees(np.arccos(np.clip(cos_zenith, -1, 1)))
+
+
+def extra_features(hours_utc, weather):
+    """Unscaled extra columns for each hour. weather: the WEATHER columns for those hours (temp_f, cloud_cover_pct).
+    hdh / cdh: how far below 65 F / above 70 F it is (heating / cooling degree hours).
+    sun_strength: sin(sun height), 0 at night. is_dark: 1 when the sun is down.
+    expected_solar: sun_strength x (1 - cloud cover), a stand-in for rooftop solar output."""
+    temp = np.asarray(weather["temp_f"], dtype=float)
+    cloud = np.clip(np.asarray(weather["cloud_cover_pct"], dtype=float), 0, 100) / 100.0
+    elevation = sun_elevation_deg(hours_utc)
+    sun = np.clip(np.sin(np.radians(elevation)), 0, None)
+    out = pd.DataFrame(index=pd.DatetimeIndex(hours_utc))
+    out["hdh"] = np.clip(65 - temp, 0, None)
+    out["cdh"] = np.clip(temp - 70, 0, None)
+    out["sun_strength"] = sun
+    out["is_dark"] = (elevation < 0).astype(float)
+    out["expected_solar"] = sun * (1 - cloud)
+    return out
+
+
 def make_inputs(issue_hour_utc, load, weather, card):
     """The model's two inputs for ONE forecast issued at issue_hour_utc.
     load: Connecticut load in MW indexed by UTC hour (only hours that are over).
@@ -106,7 +147,13 @@ def make_inputs(issue_hour_utc, load, weather, card):
     scaled_weather = []
     for column in WEATHER:
         scaled_weather.append((future_weather[column].values - card["weather_mean"][column]) / card["weather_std"][column])
-    future = np.column_stack(scaled_weather + [calendar_features(future_hours).values])
+    columns = scaled_weather + [calendar_features(future_hours).values]
+    extras = card.get("extra_features", [])
+    if extras:
+        raw = extra_features(future_hours, future_weather)
+        for name in extras:
+            columns.append((raw[name].values - card["extra_mean"][name]) / card["extra_std"][name])
+    future = np.column_stack(columns)
     return past.astype("float32"), future.astype("float32")
 
 
@@ -313,6 +360,14 @@ def run_once(dry_run: bool = False) -> dict:
         widen = float(card.get("range_widen", 1.0))
         low = expected - widen * (expected - low)
         high = expected + widen * (high - expected)
+    # Optional "offsets" (HS, Nov 2026): [{"from_utc": "...", "to_utc": "...", "mw": 15}] shifts low, expected and high
+    # by mw for forecasts issued in [from_utc, to_utc), e.g. the days after a holiday. Capped at +/-50 MW.
+    offset_mw = 0.0
+    for shift in card.get("offsets", []):
+        if pd.Timestamp(shift["from_utc"]) <= this_hour < pd.Timestamp(shift["to_utc"]):
+            offset_mw += float(np.clip(float(shift["mw"]), -50, 50))
+    if offset_mw != 0.0:
+        low, expected, high = low + offset_mw, expected + offset_mw, high + offset_mw
     range_method = method
     if weather_source == "nws_fallback":          # asked for HRRR, got the NWS forecast this hour
         range_method = method + "_nws"
@@ -330,7 +385,7 @@ def run_once(dry_run: bool = False) -> dict:
                "min_mw": float(out["predicted_load_mw"].min()), "max_mw": float(out["predicted_load_mw"].max()),
                "range_method": range_method,
                "avg_range_width_mw": None if np.isnan(low).all() else round(float(np.mean(high - low)), 1),
-               "weather_source": weather_source, "weather_runs_used": len(tables),
+               "weather_source": weather_source, "weather_runs_used": len(tables), "offset_mw": offset_mw,
                "filled_weather_values": filled_weather, "filled_load_values": filled_load,
                "network": ", ".join(layers), "params": int(model.count_params())}
     if dry_run:
